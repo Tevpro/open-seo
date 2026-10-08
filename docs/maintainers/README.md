@@ -6,4 +6,6 @@ User-facing documentation belongs in the rest of `docs/` or `web/content/docs/`.
 
 `review-guidelines.md` is the shared context for code reviewers, human and agent: hard invariants plus the false-positive controls that keep reviewers from flagging intentional behavior.
 
+Tevpro fork operators: [`tevpro-open-seo-deployment.md`](./tevpro-open-seo-deployment.md) covers upstream release intake and the guarded Cloudflare self-host deployment.
+
 Create documents when they will help future maintenance or when explicitly requested. Keep task status, PR review notes, and validation results in the PR description. Log repository friction in `.agents/PAPERCUTS.md`.

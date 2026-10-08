@@ -1,0 +1,91 @@
+name: Tevpro OpenSEO production deploy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: tevpro-openseo-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.repository == 'Tevpro/open-seo' && github.ref == 'refs/heads/main'
+    environment: openseo-production
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      ENV_SELFHOST: ${{ secrets.ENV_SELFHOST }}
+      CONFIG_VERIFIED: ${{ vars.OPENSEO_CONFIG_VERIFIED }}
+      DEPLOY_ENABLED: ${{ vars.OPENSEO_DEPLOY_ENABLED }}
+      HEALTH_URL: ${{ vars.OPENSEO_HEALTH_URL }}
+    steps:
+      - name: Fail closed until configuration and approval are complete
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CONFIG_VERIFIED" == 'true' ]] || { echo '::error::OPENSEO_CONFIG_VERIFIED must be true in the protected environment'; exit 1; }
+          [[ "$DEPLOY_ENABLED" == 'true' ]] || { echo '::error::OPENSEO_DEPLOY_ENABLED must be true in the protected environment'; exit 1; }
+          for key in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID ENV_SELFHOST; do
+            [[ -n "${!key}" ]] || { echo "::error::Missing $key"; exit 1; }
+          done
+          [[ "$HEALTH_URL" == https://*/api/health ]] || { echo '::error::Set OPENSEO_HEALTH_URL to the HTTPS production /api/health endpoint'; exit 1; }
+      - name: Checkout the requested main commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require current main tip and successful CI for this commit
+        env:
+          SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          [[ "$(git rev-parse origin/main)" == "$SHA" ]] || { echo '::error::Main has advanced; dispatch again against its latest commit'; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=30" \
+            --jq '.workflow_runs | any(.head_sha == env.SHA and .head_branch == "main" and .event == "push" and .conclusion == "success")' | \
+            { read -r ci_ok; [[ "$ci_ok" == 'true' ]] || { echo '::error::This main commit has no successful push CI run'; exit 1; }; }
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Restore complete reviewed self-host configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "$ENV_SELFHOST" > .env.selfhost
+          # Presence checks only. Never print the file or secret values.
+          for key in DATAFORSEO_API_KEY; do
+            if ! [[ $(sed -n "s/^${key}=//p" .env.selfhost | wc -c) -gt 1 ]]; then
+              echo "::error::Missing $key in ENV_SELFHOST"; exit 1
+            fi
+          done
+          if ! grep -q '^ACCESS_ALLOWED_EMAILS=.' .env.selfhost; then
+            grep -q '^TEAM_DOMAIN=.' .env.selfhost && grep -q '^POLICY_AUD=.' .env.selfhost || {
+              echo '::error::Set ACCESS_ALLOWED_EMAILS or both TEAM_DOMAIN and POLICY_AUD in ENV_SELFHOST'; exit 1;
+            }
+          fi
+      - name: Deploy the verified commit
+        run: pnpm deploy:selfhost --yes
+      # The Access gate prevents an anonymous app/database check. A non-5xx
+      # result here establishes edge reachability only, not application health.
+      - name: Check edge reachability (not an authenticated health check)
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "$HEALTH_URL")
+          [[ "$status" =~ ^(200|301|302|303|307|308|401|403)$ ]] || { echo "::error::Unexpected health endpoint status: $status"; exit 1; }
+          echo "Edge status: $status; authenticated app, database and MCP checks still required."
+          printf 'Deployed commit: %s\nEdge status: %s\nManual verification required: authenticated /api/health database status, browser login, and MCP whoami.\n' \
+            "$GITHUB_SHA" "$status" >> "$GITHUB_STEP_SUMMARY"
